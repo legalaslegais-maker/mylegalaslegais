@@ -1,5 +1,5 @@
 
-name: Temporary Windows Server 2022 Browser Desktop
+name: Temporary Windows Server Browser Desktop
 
 on:
   workflow_dispatch:
