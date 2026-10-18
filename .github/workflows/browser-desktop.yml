@@ -1,161 +1,361 @@
-name: Clean Temporary Windows RDP
+
+name: Temporary Windows Server 2022 Browser Desktop
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  rdp:
-    runs-on: windows-2025
-    timeout-minutes: 3500
+  desktop:
+    runs-on: windows-2022
+    timeout-minutes: 350
 
     steps:
-      - name: Configure RDP security
+      - name: Install TightVNC and configure application-mode password
         shell: powershell
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          Set-ItemProperty `
-            'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
+          Write-Host "STAGE 1: Validate password."
 
-          Set-ItemProperty `
-            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
+          $vncPass = $env:VNC_PASSWORD
 
-          Set-ItemProperty `
-            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name SecurityLayer -Value 2
+          if ($vncPass -notmatch '^[A-Za-z0-9]{8}$') {
+            throw "Set VNC_PASSWORD to exactly 8 letters or numbers."
+          }
 
-          Remove-NetFirewallRule `
-            -DisplayName "RDP-Tailscale" `
+          Write-Host "STAGE 2: Download TightVNC."
+
+          $msi = Join-Path $env:TEMP "tightvnc.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi" `
+            -OutFile $msi `
+            -UseBasicParsing
+
+          if (-not (Test-Path $msi) -or
+              (Get-Item $msi).Length -lt 1000000) {
+            throw "TightVNC download is incomplete."
+          }
+
+          Write-Host "STAGE 3: Install the VNC server without service mode."
+
+          $msiArgs = @(
+            "/i"
+            ('"{0}"' -f $msi)
+            "/quiet"
+            "/norestart"
+            "ADDLOCAL=Server"
+            "SERVER_REGISTER_AS_SERVICE=0"
+            "SERVER_ADD_FIREWALL_EXCEPTION=0"
+          ) -join " "
+
+          $installer = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList $msiArgs `
+            -Wait `
+            -PassThru
+
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+
+          if ($installer.ExitCode -notin @(0, 3010)) {
+            throw "TightVNC installation failed: $($installer.ExitCode)."
+          }
+
+          # Stop any service-mode instance that may have been installed.
+          $service = Get-Service -Name "tvnserver" `
             -ErrorAction SilentlyContinue
 
-          New-NetFirewallRule `
-            -DisplayName "RDP-Tailscale" `
-            -Direction Inbound `
-            -Action Allow `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress "100.64.0.0/10" `
-            -Profile Any
+          if ($service -and $service.Status -eq "Running") {
+            Stop-Service -Name $service.Name -Force
+            Start-Sleep -Seconds 2
+          }
 
-          Set-Service TermService -StartupType Automatic
-          Start-Service TermService
+          $tvn = Join-Path $env:ProgramFiles "TightVNC\tvnserver.exe"
 
-      - name: Create RDP account
+          if (-not (Test-Path $tvn)) {
+            throw "TightVNC server executable was not found."
+          }
+
+          Write-Host "STAGE 4: Configure this user's TightVNC settings."
+
+          $appKey = "HKCU:\Software\TightVNC\Server"
+          New-Item -Path $appKey -Force | Out-Null
+
+          # TightVNC stores its legacy VNC password as an encrypted
+          # 8-byte value. This configuration is for application mode.
+          $plainBytes = [System.Text.Encoding]::ASCII.GetBytes($vncPass)
+
+          $des = [System.Security.Cryptography.DES]::Create()
+          $des.Key = [byte[]]@(0xE8, 0x4A, 0xD6, 0x60, 0xC4, 0x72, 0x1A, 0xE0)
+          $des.IV = [byte[]]@(0, 0, 0, 0, 0, 0, 0, 0)
+          $des.Mode = [System.Security.Cryptography.CipherMode]::CBC
+          $des.Padding = [System.Security.Cryptography.PaddingMode]::None
+
+          $encryptor = $des.CreateEncryptor()
+
+          try {
+            $encryptedPassword = $encryptor.TransformFinalBlock(
+              $plainBytes, 0, $plainBytes.Length
+            )
+          }
+          finally {
+            $encryptor.Dispose()
+            $des.Dispose()
+          }
+
+          New-ItemProperty `
+            -Path $appKey `
+            -Name "Password" `
+            -PropertyType Binary `
+            -Value $encryptedPassword `
+            -Force | Out-Null
+
+          $settings = @{
+            UseVncAuthentication = 1
+            AcceptRfbConnections = 1
+            RfbPort = 5900
+            SocketConnect = 1
+            AutoPortSelect = 0
+            LoopbackOnly = 1
+            AllowLoopback = 1
+            RunAsService = 0
+            RemoveWallpaper = 1
+            AlwaysShared = 1
+            NeverShared = 0
+            DisconnectClients = 0
+            AcceptHttpConnections = 0
+            QueryConnect = 0
+          }
+
+          foreach ($entry in $settings.GetEnumerator()) {
+            New-ItemProperty `
+              -Path $appKey `
+              -Name $entry.Key `
+              -PropertyType DWord `
+              -Value $entry.Value `
+              -Force | Out-Null
+          }
+
+          Write-Host "SUCCESS: Application-mode VNC configuration written."
+          Write-Host "VNC password was not printed."
+
+      - name: Start interactive desktop, noVNC, and Cloudflare tunnel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Replace with a unique, strong password.
-          $password = "0405758923AA@@!!!!!!"
+          $work = Join-Path $env:TEMP "browser-desktop"
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-          if ($password -eq "0405758923AA@@!!!!!!" -or
-              $password.Length -lt 16) {
-            throw "Set a unique password of at least 16 characters."
+          Write-Host "STAGE 5: Diagnose the Windows desktop session."
+
+          $shellSession = (Get-Process -Id $PID).SessionId
+          Write-Host "PowerShell session ID: $shellSession"
+          Write-Host "SESSIONNAME: $env:SESSIONNAME"
+          Write-Host "Current Windows user:"
+          whoami
+          Write-Host "Windows sessions:"
+          query session 2>&1
+
+          Add-Type @"
+          using System.Runtime.InteropServices;
+          public static class DesktopSessionInfo {
+            [DllImport("kernel32.dll")]
+            public static extern uint WTSGetActiveConsoleSessionId();
+          }
+          "@
+
+          $activeConsole = [DesktopSessionInfo]::WTSGetActiveConsoleSessionId()
+          Write-Host "Active console session ID: $activeConsole"
+
+          if ($shellSession -eq 0 -or $shellSession -ne $activeConsole) {
+            Write-Warning "The Actions process may not be attached to the active interactive desktop. VNC input cannot be guaranteed in this session."
           }
 
-          $secure = ConvertTo-SecureString `
-            $password -AsPlainText -Force
+          $explorer = Get-Process explorer -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -eq $shellSession } |
+            Select-Object -First 1
 
-          if (-not (Get-LocalUser -Name RDP `
-              -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name RDP `
-              -Password $secure `
-              -AccountNeverExpires | Out-Null
-          } else {
-            Set-LocalUser -Name RDP -Password $secure
+          if (-not $explorer) {
+            Write-Host "Explorer is not running in this session; attempting to start it."
+            Start-Process "$env:WINDIR\explorer.exe"
+            Start-Sleep -Seconds 3
           }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member RDP `
-            -ErrorAction SilentlyContinue
+          Write-Host "STAGE 6: Start TightVNC in application mode."
 
-      - name: Install official Tailscale client
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
+          $tvn = Join-Path $env:ProgramFiles "TightVNC\tvnserver.exe"
 
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $file = "$env:TEMP\tailscale.msi"
+          $vncProcess = Start-Process `
+            -FilePath $tvn `
+            -ArgumentList "-run" `
+            -PassThru
 
-          Invoke-WebRequest -Uri $url -OutFile $file
+          Start-Sleep -Seconds 3
 
-          $sig = Get-AuthenticodeSignature $file
-          if ($sig.Status -ne "Valid" -or
-              $sig.SignerCertificate.Subject -notmatch "Tailscale") {
-            Remove-Item $file -Force -ErrorAction SilentlyContinue
-            throw "Installer signature verification failed."
+          if ($vncProcess.HasExited) {
+            throw "TightVNC application mode exited immediately."
           }
 
-          $proc = Start-Process msiexec.exe `
-            -ArgumentList "/i `"$file`" /quiet /norestart" `
-            -Wait -PassThru
+          $vncReady = $false
 
-          Remove-Item $file -Force
+          for ($i = 0; $i -lt 30; $i++) {
+            $vncReady = Test-NetConnection `
+              -ComputerName "127.0.0.1" `
+              -Port 5900 `
+              -InformationLevel Quiet `
+              -WarningAction SilentlyContinue
 
-          if ($proc.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed."
+            if ($vncReady) {
+              break
+            }
+
+            Start-Sleep -Seconds 2
           }
 
-      - name: Connect private Tailscale network
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # Paste your Tailscale auth key here.
-          $authKey = "tskey-auth-kXYN6y36Yn11CNTRL-y7mjPsByebVu2Q4o5MbDbV9miLybLr1f"
-
-          if ($authKey -eq "tskey-auth-kXYN6y36Yn11CNTRL-y7mjPsByebVu2Q4o5MbDbV9miLybLr1f") {
-            throw "Insert your Tailscale auth key."
+          if (-not $vncReady) {
+            throw "Application-mode VNC did not listen on localhost:5900."
           }
 
-          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $vncSession = (Get-Process -Id $vncProcess.Id).SessionId
+          Write-Host "TightVNC process session ID: $vncSession"
 
-          & $exe up "--authkey=$authKey" `
-            "--hostname=temporary-rdp-$env:GITHUB_RUN_ID"
+          if ($vncSession -ne $shellSession) {
+            throw "TightVNC is running in a different session from the workflow shell."
+          }
+
+          Write-Host "STAGE 7: Download noVNC."
+
+          $zip = Join-Path $work "novnc.zip"
+          $novncDir = Join-Path $work "noVNC-1.7.0"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.zip" `
+            -OutFile $zip `
+            -UseBasicParsing
+
+          Expand-Archive -Path $zip `
+            -DestinationPath $work -Force
+
+          Remove-Item $zip -Force
+
+          if (-not (Test-Path (Join-Path $novncDir "vnc.html"))) {
+            throw "noVNC vnc.html was not found."
+          }
+
+          Write-Host "STAGE 8: Install websockify."
+
+          python -m pip install `
+            --disable-pip-version-check `
+            "websockify==0.13.0"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
+            throw "websockify installation failed."
           }
 
-          $ip = $null
-          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
-            Start-Sleep -Seconds 5
-            $ip = (& $exe ip -4 | Select-Object -First 1)
+          $indexHtml = @'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Windows Desktop</title>
+            <script>
+              window.location.replace(
+                "/vnc.html?autoconnect=true&reconnect=true&reconnect_delay=3000&resize=scale&quality=5&compression=6&path=websockify"
+              );
+            </script>
+          </head>
+          <body>
+            <p>Opening Windows desktop...</p>
+            <a href="/vnc.html">Open noVNC</a>
+          </body>
+          </html>
+          '@
+
+          Set-Content `
+            -LiteralPath (Join-Path $novncDir "index.html") `
+            -Value $indexHtml `
+            -Encoding UTF8
+
+          Write-Host "STAGE 9: Start the WebSocket proxy."
+
+          $pythonExe = (Get-Command python -ErrorAction Stop).Source
+          $proxyOut = Join-Path $work "websockify-out.log"
+          $proxyErr = Join-Path $work "websockify-err.log"
+
+          $proxyArgs = '-m websockify --web "' +
+            $novncDir +
+            '" --heartbeat 15 127.0.0.1:6080 127.0.0.1:5900'
+
+          $proxy = Start-Process `
+            -FilePath $pythonExe `
+            -ArgumentList $proxyArgs `
+            -RedirectStandardOutput $proxyOut `
+            -RedirectStandardError $proxyErr `
+            -WindowStyle Hidden `
+            -PassThru
+
+          $webReady = $false
+
+          for ($i = 0; $i -lt 30; $i++) {
+            if ($proxy.HasExited) {
+              if (Test-Path $proxyOut) { Get-Content $proxyOut }
+              if (Test-Path $proxyErr) { Get-Content $proxyErr }
+              throw "Websockify exited unexpectedly."
+            }
+
+            try {
+              $page = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:6080/vnc.html" `
+                -UseBasicParsing `
+                -TimeoutSec 5
+
+              if ($page.StatusCode -eq 200) {
+                $webReady = $true
+                break
+              }
+            }
+            catch {
+              Start-Sleep -Seconds 2
+            }
           }
 
-          if (-not $ip) {
-            throw "Tailscale IP was not assigned."
+          if (-not $webReady) {
+            if (Test-Path $proxyOut) { Get-Content $proxyOut }
+            if (Test-Path $proxyErr) { Get-Content $proxyErr }
+            throw "The local noVNC page is not responding."
           }
 
-          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "SUCCESS: noVNC is serving HTTP on localhost:6080."
 
-      - name: Verify RDP
-        shell: powershell
-        run: |
-          Write-Host "RDP address: $env:TAILSCALE_IP"
-          Write-Host "Username: Davizinho20143"
-          Write-Host "Use your configured RDP password."
+          Write-Host "STAGE 10: Download Cloudflare Tunnel."
 
-          $test = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389
+          $cloudflared = Join-Path $work "cloudflared.exe"
 
-          if (-not $test.TcpTestSucceeded) {
-            throw "RDP port test failed."
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile $cloudflared `
+            -UseBasicParsing
+
+          if ((Get-Item $cloudflared).Length -lt 1000000) {
+            throw "Cloudflare Tunnel download is incomplete."
           }
 
-          Write-Host "TCP port is reachable."
+          Write-Host "STAGE 11: Starting the tunnel with HTTP/2."
+          Write-Host "Copy the new trycloudflare.com URL printed below."
+          Write-Host "Open it in Chrome. Enter your VNC_PASSWORD when prompted."
+          Write-Host "Keep this workflow running while using the desktop."
 
-      - name: Keep session active
-        shell: powershell
-        run: |
-          while ($true) {
-            Write-Host "Temporary session active: $(Get-Date)"
-            Start-Sleep -Seconds 300
+          & $cloudflared tunnel `
+            --no-autoupdate `
+            --protocol http2 `
+            --url "http://127.0.0.1:6080"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cloudflare Tunnel exited with code $LASTEXITCODE."
           }
