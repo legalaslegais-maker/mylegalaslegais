@@ -1,220 +1,161 @@
-
-name: Windows Development and Tests
+name: Clean Temporary Windows RDP
 
 on:
   workflow_dispatch:
-  push:
-  pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: windows-2022
-    timeout-minutes: 30
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 3500
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Inspect project and detect languages
-        id: detect
-        shell: pwsh
+      - name: Configure RDP security
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=== Windows runner ==="
-          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
-          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+          Set-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
 
-          Write-Host "`n=== Repository root ==="
-          Get-ChildItem -Force |
-            Select-Object Mode, Length, Name |
-            Format-Table -AutoSize
+          Set-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
 
-          $files = Get-ChildItem -Path . -Recurse -File `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.FullName -notmatch '[\\/](node_modules|\.git|bin|obj|\.venv|dist|build)[\\/]'
-            }
+          Set-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name SecurityLayer -Value 2
 
-          $node = Test-Path "package.json"
-          $python = (
-            (Test-Path "requirements.txt") -or
-            (Test-Path "pyproject.toml") -or
-            ($files.Extension -contains ".py")
-          )
+          Remove-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue
 
-          $solution = $files |
-            Where-Object { $_.Extension -in @(".sln", ".slnx", ".csproj") } |
-            Select-Object -First 1
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
 
-          $dotnet = $null -ne $solution
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
 
-          "node=$("$node".ToLower())" >> $env:GITHUB_OUTPUT
-          "python=$("$python".ToLower())" >> $env:GITHUB_OUTPUT
-          "dotnet=$("$dotnet".ToLower())" >> $env:GITHUB_OUTPUT
+      - name: Create RDP account
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          Write-Host "`n=== Detected project files ==="
+          # Replace with a unique, strong password.
+          $password = "0405758923AA@@!!"
 
-          $files |
-            Where-Object {
-              $_.Name -match '^(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements\.txt|pyproject\.toml|pytest\.ini|.*\.slnx?|.*\.csproj)$'
-            } |
-            Select-Object -ExpandProperty FullName
-
-          Write-Host "`nNode.js project: $node"
-          Write-Host "Python project: $python"
-          Write-Host ".NET project: $dotnet"
-
-          if (-not ($node -or $python -or $dotnet)) {
-            Write-Host "::warning::No recognized Node.js, Python, or .NET project detected. Inspect the file list to determine the correct test commands."
+          if ($password -eq "0405758923AA@@!!" -or
+              $password.Length -lt 16) {
+            throw "Set a unique password of at least 16 characters."
           }
 
-      - name: Set up Node.js
-        if: steps.detect.outputs.node == 'true'
-        uses: actions/setup-node@v6
-        with:
-          node-version: "22"
+          $secure = ConvertTo-SecureString `
+            $password -AsPlainText -Force
 
-      - name: Install and test Node.js project
-        if: steps.detect.outputs.node == 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:CI = "true"
-
-          $package = Get-Content package.json -Raw | ConvertFrom-Json
-
-          Write-Host "=== Installing Node.js dependencies ==="
-
-          if (Test-Path "package-lock.json") {
-            npm ci
-          } elseif (Test-Path "pnpm-lock.yaml") {
-            corepack enable
-            if ($LASTEXITCODE -ne 0) { throw "Could not enable Corepack." }
-            corepack pnpm install --frozen-lockfile
-          } elseif (Test-Path "yarn.lock") {
-            corepack enable
-            if ($LASTEXITCODE -ne 0) { throw "Could not enable Corepack." }
-
-            if ($package.packageManager -match '^yarn@1\.') {
-              corepack yarn install --frozen-lockfile
-            } else {
-              corepack yarn install --immutable
-            }
+          if (-not (Get-LocalUser -Name RDP `
+              -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name RDP `
+              -Password $secure `
+              -AccountNeverExpires | Out-Null
           } else {
-            npm install
+            Set-LocalUser -Name RDP -Password $secure
           }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member RDP `
+            -ErrorAction SilentlyContinue
+
+      - name: Install official Tailscale client
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $file = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $file
+
+          $sig = Get-AuthenticodeSignature $file
+          if ($sig.Status -ne "Valid" -or
+              $sig.SignerCertificate.Subject -notmatch "Tailscale") {
+            Remove-Item $file -Force -ErrorAction SilentlyContinue
+            throw "Installer signature verification failed."
+          }
+
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$file`" /quiet /norestart" `
+            -Wait -PassThru
+
+          Remove-Item $file -Force
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed."
+          }
+
+      - name: Connect private Tailscale network
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Paste your Tailscale auth key here.
+          $authKey = "tskey-auth-kXYN6y36Yn11CNTRL-y7mjPsByebVu2Q4o5MbDbV9miLybLr1f"
+
+          if ($authKey -eq "tskey-auth-kXYN6y36Yn11CNTRL-y7mjPsByebVu2Q4o5MbDbV9miLybLr1f") {
+            throw "Insert your Tailscale auth key."
+          }
+
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $exe up "--authkey=$authKey" `
+            "--hostname=temporary-rdp-$env:GITHUB_RUN_ID"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Dependency installation failed."
+            throw "Tailscale connection failed."
           }
 
-          $scripts = $package.scripts
-          if ($null -eq $scripts) {
-            Write-Host "No npm scripts are declared."
-            exit 0
+          $ip = $null
+          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 5
+            $ip = (& $exe ip -4 | Select-Object -First 1)
           }
 
-          foreach ($name in @("test", "lint", "build")) {
-            $script = $scripts.PSObject.Properties[$name]
-
-            if ($null -ne $script) {
-              Write-Host "`n=== Running $name ==="
-              npm run $name
-
-              if ($LASTEXITCODE -ne 0) {
-                throw "The npm '$name' script failed with exit code $LASTEXITCODE."
-              }
-            } else {
-              Write-Host "Skipping '$name': no such script in package.json."
-            }
+          if (-not $ip) {
+            throw "Tailscale IP was not assigned."
           }
 
-      - name: Set up Python
-        if: steps.detect.outputs.python == 'true'
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Install and test Python project
-        if: steps.detect.outputs.python == 'true'
-        shell: pwsh
+      - name: Verify RDP
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "RDP address: $env:TAILSCALE_IP"
+          Write-Host "Username: Davizinho20143"
+          Write-Host "Use your configured RDP password."
 
-          python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
+          $test = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
 
-          if (Test-Path "requirements.txt") {
-            python -m pip install -r requirements.txt
-            if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed." }
-          } elseif (Test-Path "pyproject.toml") {
-            python -m pip install -e .
-            if ($LASTEXITCODE -ne 0) { throw "Python project installation failed." }
+          if (-not $test.TcpTestSucceeded) {
+            throw "RDP port test failed."
           }
 
-          $tests = Get-ChildItem -Path . -Recurse -File `
-            -Include "test_*.py", "*_test.py" `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.FullName -notmatch '[\\/](node_modules|\.git|\.venv|dist|build)[\\/]'
-            }
+          Write-Host "TCP port is reachable."
 
-          if (@($tests).Count -gt 0) {
-            python -m pip install pytest
-            if ($LASTEXITCODE -ne 0) { throw "Could not install pytest." }
-
-            python -m pytest -q
-            if ($LASTEXITCODE -ne 0) { throw "Python tests failed." }
-          } else {
-            Write-Host "No standard Python test files were detected."
-          }
-
-      - name: Test .NET project
-        if: steps.detect.outputs.dotnet == 'true'
-        shell: pwsh
+      - name: Keep session active
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-
-          dotnet --info
-          if ($LASTEXITCODE -ne 0) { throw ".NET SDK unavailable." }
-
-          $solution = Get-ChildItem -Path . -Recurse -File `
-            -Include "*.sln", "*.slnx" |
-            Where-Object {
-              $_.FullName -notmatch '[\\/](bin|obj|\.git)[\\/]'
-            } |
-            Select-Object -First 1
-
-          if ($solution) {
-            Write-Host "Testing solution: $($solution.FullName)"
-            dotnet test $solution.FullName --configuration Release
-          } else {
-            $project = Get-ChildItem -Path . -Recurse -File `
-              -Filter "*.csproj" |
-              Where-Object {
-                $_.FullName -notmatch '[\\/](bin|obj|\.git)[\\/]'
-              } |
-              Select-Object -First 1
-
-            if ($project) {
-              Write-Host "Testing project: $($project.FullName)"
-              dotnet test $project.FullName --configuration Release
-            } else {
-              throw "No .NET solution or project found."
-            }
+          while ($true) {
+            Write-Host "Temporary session active: $(Get-Date)"
+            Start-Sleep -Seconds 300
           }
-
-          if ($LASTEXITCODE -ne 0) {
-            throw ".NET build or tests failed."
-          }
-
-      - name: Finished
-        if: success()
-        shell: pwsh
-        run: |
-          Write-Host "All applicable detected project checks finished successfully."
-          Write-Host "Review the earlier steps to see which tests actually ran."
