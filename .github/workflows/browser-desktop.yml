@@ -4,8 +4,7 @@ name: Temporary Windows Server 2022 Browser Desktop
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   desktop:
@@ -13,45 +12,22 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Configure Windows and install TightVNC
+      - name: Install and configure TightVNC
         shell: powershell
         env:
-          WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "STAGE 1: Validating secrets."
+          Write-Host "STAGE 1: Validate VNC password."
 
-          $winPass = $env:WINDOWS_PASSWORD
           $vncPass = $env:VNC_PASSWORD
-
-          if ([string]::IsNullOrWhiteSpace($winPass) -or
-              $winPass.Length -lt 16) {
-            throw "WINDOWS_PASSWORD must be at least 16 characters."
-          }
 
           if ($vncPass -notmatch '^[A-Za-z0-9]{8}$') {
             throw "VNC_PASSWORD must be exactly 8 letters or numbers."
           }
 
-          Write-Host "STAGE 2: Configuring the Windows account."
-
-          $runnerUser = Get-LocalUser -Name "runneradmin" -ErrorAction Stop
-          $securePassword = ConvertTo-SecureString `
-            $winPass -AsPlainText -Force
-
-          Set-LocalUser -Name $runnerUser.Name -Password $securePassword
-
-          Write-Host "STAGE 3: Downloading TightVNC 2.8.90."
+          Write-Host "STAGE 2: Download TightVNC."
 
           $msi = Join-Path $env:TEMP "tightvnc.msi"
 
@@ -65,7 +41,7 @@ jobs:
             throw "TightVNC installer download is incomplete."
           }
 
-          Write-Host "STAGE 4: Installing the server and configuring authentication."
+          Write-Host "STAGE 3: Install VNC server and set authentication."
 
           $msiArgs = @(
             "/i"
@@ -87,14 +63,14 @@ jobs:
             "VALUE_OF_LOOPBACKONLY=1"
             "SET_ACCEPTHTTPCONNECTIONS=1"
             "VALUE_OF_ACCEPTHTTPCONNECTIONS=0"
-            "SET_POLLINGINTERVAL=1"
-            "VALUE_OF_POLLINGINTERVAL=250"
-            "SET_REMOVEWALLPAPER=1"
-            "VALUE_OF_REMOVEWALLPAPER=1"
             "SET_ALWAYSSHARED=1"
             "VALUE_OF_ALWAYSSHARED=1"
             "SET_DISCONNECTACTION=1"
             "VALUE_OF_DISCONNECTACTION=0"
+            "SET_POLLINGINTERVAL=1"
+            "VALUE_OF_POLLINGINTERVAL=500"
+            "SET_REMOVEWALLPAPER=1"
+            "VALUE_OF_REMOVEWALLPAPER=1"
           ) -join " "
 
           $install = Start-Process `
@@ -106,10 +82,10 @@ jobs:
           Remove-Item $msi -Force -ErrorAction SilentlyContinue
 
           if ($install.ExitCode -notin @(0, 3010)) {
-            throw "TightVNC installation failed with exit code $($install.ExitCode)."
+            throw "TightVNC installation failed: exit code $($install.ExitCode)."
           }
 
-          Write-Host "STAGE 5: Starting and checking the VNC service."
+          Write-Host "STAGE 4: Start VNC service."
 
           $service = Get-Service -Name "tvnserver" `
             -ErrorAction SilentlyContinue
@@ -126,51 +102,54 @@ jobs:
 
           Set-Service -Name $service.Name -StartupType Automatic
 
-          if ($service.Status -eq "Running") {
-            Restart-Service -Name $service.Name -Force
-          } else {
-            Start-Service -Name $service.Name
-          }
+          Stop-Service -Name $service.Name `
+            -Force -ErrorAction SilentlyContinue
 
-          $vncReady = $false
+          Start-Sleep -Seconds 2
+          Start-Service -Name $service.Name
+
+          $ready = $false
 
           for ($i = 0; $i -lt 30; $i++) {
-            $vncReady = Test-NetConnection `
+            $ready = Test-NetConnection `
               -ComputerName "127.0.0.1" `
               -Port 5900 `
               -InformationLevel Quiet `
               -WarningAction SilentlyContinue
 
-            if ($vncReady) {
+            if ($ready) {
               break
             }
 
             Start-Sleep -Seconds 2
           }
 
-          if (-not $vncReady) {
-            throw "TightVNC did not listen on 127.0.0.1:5900."
+          if (-not $ready) {
+            throw "VNC did not start on 127.0.0.1:5900."
           }
 
-          Write-Host "SUCCESS: TightVNC is listening locally."
+          Write-Host "SUCCESS: TightVNC is listening on localhost:5900."
 
-      - name: Install noVNC and start browser gateway
+      - name: Start browser desktop and Cloudflare tunnel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "STAGE 6: Downloading noVNC 1.6.0."
+          $work = Join-Path $env:TEMP "browser-desktop"
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-          $zip = Join-Path $env:TEMP "novnc.zip"
-          $novncDir = Join-Path $env:TEMP "noVNC-1.6.0"
+          Write-Host "STAGE 5: Download noVNC 1.7.0."
+
+          $zip = Join-Path $work "novnc.zip"
+          $novncDir = Join-Path $work "noVNC-1.7.0"
 
           Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.zip" `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.zip" `
             -OutFile $zip `
             -UseBasicParsing
 
           Expand-Archive -Path $zip `
-            -DestinationPath $env:TEMP -Force
+            -DestinationPath $work -Force
 
           Remove-Item $zip -Force
 
@@ -178,7 +157,7 @@ jobs:
             throw "noVNC vnc.html was not found."
           }
 
-          Write-Host "STAGE 7: Installing a pinned websockify version."
+          Write-Host "STAGE 6: Install websockify."
 
           python -m pip install `
             --disable-pip-version-check `
@@ -188,7 +167,7 @@ jobs:
             throw "websockify installation failed."
           }
 
-          Write-Host "STAGE 8: Configuring the default browser page."
+          Write-Host "STAGE 7: Configure the desktop landing page."
 
           $indexHtml = @'
           <!doctype html>
@@ -202,10 +181,9 @@ jobs:
                 "/vnc.html#autoconnect=true&reconnect=true&reconnect_delay=3000&resize=scale&quality=5&compression=6&path=websockify"
               );
             </script>
-            <meta http-equiv="refresh" content="0;url=/vnc.html">
           </head>
           <body>
-            Opening your cloud desktop...
+            <p>Opening desktop...</p>
             <a href="/vnc.html">Open noVNC</a>
           </body>
           </html>
@@ -216,11 +194,11 @@ jobs:
             -Value $indexHtml `
             -Encoding UTF8
 
-          Write-Host "STAGE 9: Starting the WebSocket gateway."
+          Write-Host "STAGE 8: Start the WebSocket gateway."
 
           $pythonExe = (Get-Command python -ErrorAction Stop).Source
-          $proxyOut = Join-Path $env:TEMP "websockify-out.log"
-          $proxyErr = Join-Path $env:TEMP "websockify-err.log"
+          $proxyOut = Join-Path $work "websockify-out.log"
+          $proxyErr = Join-Path $work "websockify-err.log"
 
           $proxyArgs = '-m websockify --web "' +
             $novncDir +
@@ -229,12 +207,12 @@ jobs:
           $proxy = Start-Process `
             -FilePath $pythonExe `
             -ArgumentList $proxyArgs `
-            -WindowStyle Hidden `
             -RedirectStandardOutput $proxyOut `
             -RedirectStandardError $proxyErr `
+            -WindowStyle Hidden `
             -PassThru
 
-          $webReady = $false
+          $ready = $false
 
           for ($i = 0; $i -lt 30; $i++) {
             if ($proxy.HasExited) {
@@ -243,43 +221,32 @@ jobs:
               throw "Websockify exited unexpectedly."
             }
 
-            $webReady = Test-NetConnection `
-              -ComputerName "127.0.0.1" `
-              -Port 6080 `
-              -InformationLevel Quiet `
-              -WarningAction SilentlyContinue
+            try {
+              $page = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:6080/vnc.html" `
+                -UseBasicParsing `
+                -TimeoutSec 5
 
-            if ($webReady) {
-              break
+              if ($page.StatusCode -eq 200) {
+                $ready = $true
+                break
+              }
+            } catch {
+              Start-Sleep -Seconds 2
             }
-
-            Start-Sleep -Seconds 2
           }
 
-          if (-not $webReady) {
+          if (-not $ready) {
+            if (Test-Path $proxyOut) { Get-Content $proxyOut }
             if (Test-Path $proxyErr) { Get-Content $proxyErr }
-            throw "The noVNC gateway did not start on port 6080."
+            throw "The local noVNC page did not become ready."
           }
 
-          $response = Invoke-WebRequest `
-            -Uri "http://127.0.0.1:6080/" `
-            -UseBasicParsing `
-            -TimeoutSec 15
+          Write-Host "SUCCESS: noVNC is serving HTTP on localhost:6080."
 
-          if ($response.StatusCode -ne 200) {
-            throw "The noVNC homepage did not return HTTP 200."
-          }
+          Write-Host "STAGE 9: Download Cloudflare Tunnel."
 
-          Write-Host "SUCCESS: Browser gateway is running."
-
-      - name: Start Cloudflare Quick Tunnel
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "STAGE 10: Downloading Cloudflare Tunnel."
-
-          $cloudflared = Join-Path $env:TEMP "cloudflared.exe"
+          $cloudflared = Join-Path $work "cloudflared.exe"
 
           Invoke-WebRequest `
             -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
@@ -288,13 +255,13 @@ jobs:
 
           if (-not (Test-Path $cloudflared) -or
               (Get-Item $cloudflared).Length -lt 1000000) {
-            throw "Cloudflare Tunnel download appears incomplete."
+            throw "Cloudflare Tunnel download is incomplete."
           }
 
-          Write-Host "STAGE 11: Opening your temporary browser desktop."
-          Write-Host "Find the trycloudflare.com URL below."
-          Write-Host "Open that URL in Chrome. The root page redirects to noVNC."
-          Write-Host "Keep this workflow running for the entire session."
+          Write-Host "STAGE 10: Start Cloudflare using HTTP/2."
+          Write-Host "Copy the URL created by THIS workflow run."
+          Write-Host "Open the URL in Chrome, or add /vnc.html."
+          Write-Host "Leave this step running while using the desktop."
 
           & $cloudflared tunnel `
             --no-autoupdate `
