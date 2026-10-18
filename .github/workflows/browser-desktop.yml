@@ -1,273 +1,220 @@
 
-name: Temporary Windows Server 2022 Browser Desktop
+name: Windows Development and Tests
 
 on:
   workflow_dispatch:
+  push:
+  pull_request:
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
-  desktop:
+  test:
     runs-on: windows-2022
-    timeout-minutes: 350
+    timeout-minutes: 30
 
     steps:
-      - name: Install and configure TightVNC
-        shell: powershell
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Inspect project and detect languages
+        id: detect
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "STAGE 1: Validate VNC password."
+          Write-Host "=== Windows runner ==="
+          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
 
-          $vncPass = $env:VNC_PASSWORD
+          Write-Host "`n=== Repository root ==="
+          Get-ChildItem -Force |
+            Select-Object Mode, Length, Name |
+            Format-Table -AutoSize
 
-          if ($vncPass -notmatch '^[A-Za-z0-9]{8}$') {
-            throw "VNC_PASSWORD must be exactly 8 letters or numbers."
-          }
-
-          Write-Host "STAGE 2: Download TightVNC."
-
-          $msi = Join-Path $env:TEMP "tightvnc.msi"
-
-          Invoke-WebRequest `
-            -Uri "https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi" `
-            -OutFile $msi `
-            -UseBasicParsing
-
-          if (-not (Test-Path $msi) -or
-              (Get-Item $msi).Length -lt 1000000) {
-            throw "TightVNC installer download is incomplete."
-          }
-
-          Write-Host "STAGE 3: Install VNC server and set authentication."
-
-          $msiArgs = @(
-            "/i"
-            ('"{0}"' -f $msi)
-            "/quiet"
-            "/norestart"
-            "ADDLOCAL=Server"
-            "SERVER_REGISTER_AS_SERVICE=1"
-            "SERVER_ADD_FIREWALL_EXCEPTION=0"
-            "SET_ACCEPTRFBCONNECTIONS=1"
-            "VALUE_OF_ACCEPTRFBCONNECTIONS=1"
-            "SET_USEVNCAUTHENTICATION=1"
-            "VALUE_OF_USEVNCAUTHENTICATION=1"
-            "SET_PASSWORD=1"
-            "VALUE_OF_PASSWORD=$vncPass"
-            "SET_ALLOWLOOPBACK=1"
-            "VALUE_OF_ALLOWLOOPBACK=1"
-            "SET_LOOPBACKONLY=1"
-            "VALUE_OF_LOOPBACKONLY=1"
-            "SET_ACCEPTHTTPCONNECTIONS=1"
-            "VALUE_OF_ACCEPTHTTPCONNECTIONS=0"
-            "SET_ALWAYSSHARED=1"
-            "VALUE_OF_ALWAYSSHARED=1"
-            "SET_DISCONNECTACTION=1"
-            "VALUE_OF_DISCONNECTACTION=0"
-            "SET_POLLINGINTERVAL=1"
-            "VALUE_OF_POLLINGINTERVAL=500"
-            "SET_REMOVEWALLPAPER=1"
-            "VALUE_OF_REMOVEWALLPAPER=1"
-          ) -join " "
-
-          $install = Start-Process `
-            -FilePath "msiexec.exe" `
-            -ArgumentList $msiArgs `
-            -Wait `
-            -PassThru
-
-          Remove-Item $msi -Force -ErrorAction SilentlyContinue
-
-          if ($install.ExitCode -notin @(0, 3010)) {
-            throw "TightVNC installation failed: exit code $($install.ExitCode)."
-          }
-
-          Write-Host "STAGE 4: Start VNC service."
-
-          $service = Get-Service -Name "tvnserver" `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $service) {
-            $service = Get-Service |
-              Where-Object { $_.DisplayName -match "TightVNC" } |
-              Select-Object -First 1
-          }
-
-          if ($null -eq $service) {
-            throw "TightVNC service was not found."
-          }
-
-          Set-Service -Name $service.Name -StartupType Automatic
-
-          Stop-Service -Name $service.Name `
-            -Force -ErrorAction SilentlyContinue
-
-          Start-Sleep -Seconds 2
-          Start-Service -Name $service.Name
-
-          $ready = $false
-
-          for ($i = 0; $i -lt 30; $i++) {
-            $ready = Test-NetConnection `
-              -ComputerName "127.0.0.1" `
-              -Port 5900 `
-              -InformationLevel Quiet `
-              -WarningAction SilentlyContinue
-
-            if ($ready) {
-              break
+          $files = Get-ChildItem -Path . -Recurse -File `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](node_modules|\.git|bin|obj|\.venv|dist|build)[\\/]'
             }
 
-            Start-Sleep -Seconds 2
+          $node = Test-Path "package.json"
+          $python = (
+            (Test-Path "requirements.txt") -or
+            (Test-Path "pyproject.toml") -or
+            ($files.Extension -contains ".py")
+          )
+
+          $solution = $files |
+            Where-Object { $_.Extension -in @(".sln", ".slnx", ".csproj") } |
+            Select-Object -First 1
+
+          $dotnet = $null -ne $solution
+
+          "node=$("$node".ToLower())" >> $env:GITHUB_OUTPUT
+          "python=$("$python".ToLower())" >> $env:GITHUB_OUTPUT
+          "dotnet=$("$dotnet".ToLower())" >> $env:GITHUB_OUTPUT
+
+          Write-Host "`n=== Detected project files ==="
+
+          $files |
+            Where-Object {
+              $_.Name -match '^(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements\.txt|pyproject\.toml|pytest\.ini|.*\.slnx?|.*\.csproj)$'
+            } |
+            Select-Object -ExpandProperty FullName
+
+          Write-Host "`nNode.js project: $node"
+          Write-Host "Python project: $python"
+          Write-Host ".NET project: $dotnet"
+
+          if (-not ($node -or $python -or $dotnet)) {
+            Write-Host "::warning::No recognized Node.js, Python, or .NET project detected. Inspect the file list to determine the correct test commands."
           }
 
-          if (-not $ready) {
-            throw "VNC did not start on 127.0.0.1:5900."
-          }
+      - name: Set up Node.js
+        if: steps.detect.outputs.node == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
 
-          Write-Host "SUCCESS: TightVNC is listening on localhost:5900."
-
-      - name: Start browser desktop and Cloudflare tunnel
-        shell: powershell
+      - name: Install and test Node.js project
+        if: steps.detect.outputs.node == 'true'
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $env:CI = "true"
 
-          $work = Join-Path $env:TEMP "browser-desktop"
-          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
 
-          Write-Host "STAGE 5: Download noVNC 1.7.0."
+          Write-Host "=== Installing Node.js dependencies ==="
 
-          $zip = Join-Path $work "novnc.zip"
-          $novncDir = Join-Path $work "noVNC-1.7.0"
+          if (Test-Path "package-lock.json") {
+            npm ci
+          } elseif (Test-Path "pnpm-lock.yaml") {
+            corepack enable
+            if ($LASTEXITCODE -ne 0) { throw "Could not enable Corepack." }
+            corepack pnpm install --frozen-lockfile
+          } elseif (Test-Path "yarn.lock") {
+            corepack enable
+            if ($LASTEXITCODE -ne 0) { throw "Could not enable Corepack." }
 
-          Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.7.0.zip" `
-            -OutFile $zip `
-            -UseBasicParsing
-
-          Expand-Archive -Path $zip `
-            -DestinationPath $work -Force
-
-          Remove-Item $zip -Force
-
-          if (-not (Test-Path (Join-Path $novncDir "vnc.html"))) {
-            throw "noVNC vnc.html was not found."
+            if ($package.packageManager -match '^yarn@1\.') {
+              corepack yarn install --frozen-lockfile
+            } else {
+              corepack yarn install --immutable
+            }
+          } else {
+            npm install
           }
-
-          Write-Host "STAGE 6: Install websockify."
-
-          python -m pip install `
-            --disable-pip-version-check `
-            "websockify==0.13.0"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "websockify installation failed."
+            throw "Dependency installation failed."
           }
 
-          Write-Host "STAGE 7: Configure the desktop landing page."
+          $scripts = $package.scripts
+          if ($null -eq $scripts) {
+            Write-Host "No npm scripts are declared."
+            exit 0
+          }
 
-          $indexHtml = @'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Windows Cloud Desktop</title>
-            <script>
-              window.location.replace(
-                "/vnc.html#autoconnect=true&reconnect=true&reconnect_delay=3000&resize=scale&quality=5&compression=6&path=websockify"
-              );
-            </script>
-          </head>
-          <body>
-            <p>Opening desktop...</p>
-            <a href="/vnc.html">Open noVNC</a>
-          </body>
-          </html>
-          '@
+          foreach ($name in @("test", "lint", "build")) {
+            $script = $scripts.PSObject.Properties[$name]
 
-          Set-Content `
-            -LiteralPath (Join-Path $novncDir "index.html") `
-            -Value $indexHtml `
-            -Encoding UTF8
+            if ($null -ne $script) {
+              Write-Host "`n=== Running $name ==="
+              npm run $name
 
-          Write-Host "STAGE 8: Start the WebSocket gateway."
-
-          $pythonExe = (Get-Command python -ErrorAction Stop).Source
-          $proxyOut = Join-Path $work "websockify-out.log"
-          $proxyErr = Join-Path $work "websockify-err.log"
-
-          $proxyArgs = '-m websockify --web "' +
-            $novncDir +
-            '" --heartbeat 15 127.0.0.1:6080 127.0.0.1:5900'
-
-          $proxy = Start-Process `
-            -FilePath $pythonExe `
-            -ArgumentList $proxyArgs `
-            -RedirectStandardOutput $proxyOut `
-            -RedirectStandardError $proxyErr `
-            -WindowStyle Hidden `
-            -PassThru
-
-          $ready = $false
-
-          for ($i = 0; $i -lt 30; $i++) {
-            if ($proxy.HasExited) {
-              if (Test-Path $proxyOut) { Get-Content $proxyOut }
-              if (Test-Path $proxyErr) { Get-Content $proxyErr }
-              throw "Websockify exited unexpectedly."
-            }
-
-            try {
-              $page = Invoke-WebRequest `
-                -Uri "http://127.0.0.1:6080/vnc.html" `
-                -UseBasicParsing `
-                -TimeoutSec 5
-
-              if ($page.StatusCode -eq 200) {
-                $ready = $true
-                break
+              if ($LASTEXITCODE -ne 0) {
+                throw "The npm '$name' script failed with exit code $LASTEXITCODE."
               }
-            } catch {
-              Start-Sleep -Seconds 2
+            } else {
+              Write-Host "Skipping '$name': no such script in package.json."
             }
           }
 
-          if (-not $ready) {
-            if (Test-Path $proxyOut) { Get-Content $proxyOut }
-            if (Test-Path $proxyErr) { Get-Content $proxyErr }
-            throw "The local noVNC page did not become ready."
+      - name: Set up Python
+        if: steps.detect.outputs.python == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install and test Python project
+        if: steps.detect.outputs.python == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
+
+          if (Test-Path "requirements.txt") {
+            python -m pip install -r requirements.txt
+            if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed." }
+          } elseif (Test-Path "pyproject.toml") {
+            python -m pip install -e .
+            if ($LASTEXITCODE -ne 0) { throw "Python project installation failed." }
           }
 
-          Write-Host "SUCCESS: noVNC is serving HTTP on localhost:6080."
+          $tests = Get-ChildItem -Path . -Recurse -File `
+            -Include "test_*.py", "*_test.py" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](node_modules|\.git|\.venv|dist|build)[\\/]'
+            }
 
-          Write-Host "STAGE 9: Download Cloudflare Tunnel."
+          if (@($tests).Count -gt 0) {
+            python -m pip install pytest
+            if ($LASTEXITCODE -ne 0) { throw "Could not install pytest." }
 
-          $cloudflared = Join-Path $work "cloudflared.exe"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cloudflared `
-            -UseBasicParsing
-
-          if (-not (Test-Path $cloudflared) -or
-              (Get-Item $cloudflared).Length -lt 1000000) {
-            throw "Cloudflare Tunnel download is incomplete."
+            python -m pytest -q
+            if ($LASTEXITCODE -ne 0) { throw "Python tests failed." }
+          } else {
+            Write-Host "No standard Python test files were detected."
           }
 
-          Write-Host "STAGE 10: Start Cloudflare using HTTP/2."
-          Write-Host "Copy the URL created by THIS workflow run."
-          Write-Host "Open the URL in Chrome, or add /vnc.html."
-          Write-Host "Leave this step running while using the desktop."
+      - name: Test .NET project
+        if: steps.detect.outputs.dotnet == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          & $cloudflared tunnel `
-            --no-autoupdate `
-            --protocol http2 `
-            --url "http://127.0.0.1:6080"
+          dotnet --info
+          if ($LASTEXITCODE -ne 0) { throw ".NET SDK unavailable." }
+
+          $solution = Get-ChildItem -Path . -Recurse -File `
+            -Include "*.sln", "*.slnx" |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](bin|obj|\.git)[\\/]'
+            } |
+            Select-Object -First 1
+
+          if ($solution) {
+            Write-Host "Testing solution: $($solution.FullName)"
+            dotnet test $solution.FullName --configuration Release
+          } else {
+            $project = Get-ChildItem -Path . -Recurse -File `
+              -Filter "*.csproj" |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](bin|obj|\.git)[\\/]'
+              } |
+              Select-Object -First 1
+
+            if ($project) {
+              Write-Host "Testing project: $($project.FullName)"
+              dotnet test $project.FullName --configuration Release
+            } else {
+              throw "No .NET solution or project found."
+            }
+          }
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Cloudflare Tunnel exited with code $LASTEXITCODE."
+            throw ".NET build or tests failed."
           }
+
+      - name: Finished
+        if: success()
+        shell: pwsh
+        run: |
+          Write-Host "All applicable detected project checks finished successfully."
+          Write-Host "Review the earlier steps to see which tests actually ran."
