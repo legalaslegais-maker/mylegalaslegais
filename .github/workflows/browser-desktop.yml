@@ -8,7 +8,7 @@ permissions: {}
 
 jobs:
   desktop:
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2019
     timeout-minutes: 3500000000
 
     steps:
